@@ -27,6 +27,7 @@ using namespace AscendC;
 
 constexpr uint32_t MAX_SINGLE_MN_ALIGN32_NUM_256 = 256U * 256U;
 constexpr uint32_t MAX_SINGLE_MN_ALIGN32_NUM_128 = 128U * 256U;
+constexpr uint32_t GMM1_READY_WINDOW_CONTROL_WORD = 1U;
 
 // 等待当前 GMM1 tile 对应的 Dispatch 输入就绪。
 template <bool IsShared, typename Config>
@@ -40,6 +41,58 @@ __aicore__ inline void WaitForGmm1InputReady(const GMMAddrInfo &gmmAddrInfo, con
     uint64_t flagOffset = static_cast<uint64_t>(waveIdx) * INT_CACHELINE;
     __gm__ int32_t *flagValueAddr = gmmAddrInfo.dispatchToGmm1Flag + flagOffset;
     WaitUntilGmFlagEquals(flagValueAddr, static_cast<int32_t>(targetValue));
+}
+
+/*
+ * Routed interleaved GMM1 selects a runtime M-window from Dispatch readiness.
+ *
+ * Dispatch owns word 0 of each 64B M-group flag line and atomically accumulates
+ * the number of ready rows. Word 1 is unused by Dispatch and is reused as a
+ * one-shot window-width publication slot. AIC job 0 is the only writer; every
+ * AIC and its paired AIV0 reads the same published width, so both sides replay
+ * exactly the same tile permutation.
+ *
+ * The leader waits for the first M-group of the next window, then greedily
+ * absorbs up to MaxWindow contiguous groups that are already ready. This moves
+ * waiting to window boundaries and avoids exposing a not-ready future M-group
+ * in the middle of an AIC's fixed tile queue.
+ */
+template <uint32_t MaxWindow, typename Config>
+__aicore__ inline uint32_t SelectGmm1ReadyWindow(const GMMAddrInfo &gmmAddrInfo, const Config &config,
+                                                 const BlockJobContext &blockJob, uint32_t windowStartGroup,
+                                                 uint32_t remainingGroups)
+{
+    static_assert(MaxWindow > 0U, "GMM1 ready-window width must be positive");
+    uint32_t maxWindow = remainingGroups < MaxWindow ? remainingGroups : MaxWindow;
+    __gm__ int32_t *firstGroupFlag =
+        gmmAddrInfo.dispatchToGmm1Flag + static_cast<uint64_t>(windowStartGroup) * INT_CACHELINE;
+    __gm__ int32_t *windowWidthFlag = firstGroupFlag + GMM1_READY_WINDOW_CONTROL_WORD;
+
+    if constexpr (g_coreType == AscendC::AIC) {
+        if (blockJob.jobIndex == 0U) {
+            uint32_t firstMLoc = windowStartGroup * config.tileM;
+            uint32_t firstTarget =
+                firstMLoc + config.tileM > config.m ? config.m - firstMLoc : config.tileM;
+            WaitUntilGmFlagAtLeast(firstGroupFlag, static_cast<int32_t>(firstTarget));
+
+            uint32_t readyGroups = 1U;
+            for (uint32_t localGroup = 1U; localGroup < maxWindow; ++localGroup) {
+                uint32_t groupIdx = windowStartGroup + localGroup;
+                uint32_t mLoc = groupIdx * config.tileM;
+                uint32_t target = mLoc + config.tileM > config.m ? config.m - mLoc : config.tileM;
+                __gm__ int32_t *readyFlag =
+                    gmmAddrInfo.dispatchToGmm1Flag + static_cast<uint64_t>(groupIdx) * INT_CACHELINE;
+                if (AscendC::ReadGmByPassDCache(readyFlag) < static_cast<int32_t>(target)) {
+                    break;
+                }
+                ++readyGroups;
+            }
+            AscendC::WriteGmByPassDCache(windowWidthFlag, static_cast<int32_t>(readyGroups));
+        }
+    }
+
+    WaitUntilGmFlagIsNonZero(windowWidthFlag);
+    return static_cast<uint32_t>(AscendC::ReadGmByPassDCache(windowWidthFlag));
 }
 
 namespace GmmKernel {
@@ -655,7 +708,8 @@ template <typename BlockMmad, typename ElementC, typename MakeLayoutC, bool Topk
           typename ActivationQuantOp>
 __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &params, const GMMAddrInfo &gmmAddrInfo,
                                        const Config &config, uint32_t startLoopIdx, uint32_t tileNum,
-                                       ActivationQuantOp &activationQuantOp, int32_t &vecSetSyncCom,
+                                       uint32_t problemStartBlockIdx, ActivationQuantOp &activationQuantOp,
+                                       int32_t &vecSetSyncCom,
                                        uint32_t expertBeforeCnt, uint32_t expertIdx, uint16_t &pingpongIdx,
                                        BlockMmadContext<BlockMmad> *blockMmadContext, bool allowWeightL2Bypass)
 {
@@ -695,6 +749,84 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &param
 
     using WorkSetType = Gmm1WorkSet<Scheduler, decltype(gmA), decltype(gmB), decltype(gmScaleA), decltype(gmScaleB),
                                     decltype(gmBias), decltype(gmC), decltype(metaInfoGm)>;
+
+    constexpr bool useReadyWindow =
+        !TopkWeightsPrefetch && !IsShared && IsGmm1Interleaved && IsWaveFlagGrained;
+    if constexpr (useReadyWindow) {
+        uint32_t totalMGroups = Ops::Base::CeilDiv(config.m, config.tileM);
+        uint32_t windowStartGroup = 0U;
+        uint32_t windowOrdinal = 0U;
+        uint32_t windowStartBlockIdx = problemStartBlockIdx;
+        BlockJobContext blockJob{config.blockIdx, config.blockNum};
+
+        if constexpr (g_coreType == AscendC::AIC) {
+            BlockMmadContext<BlockMmad> localBlockMmadContext;
+            BlockMmadContext<BlockMmad> *activeBlockMmadContext =
+                blockMmadContext != nullptr ? blockMmadContext : &localBlockMmadContext;
+
+            while (windowStartGroup < totalMGroups) {
+                uint32_t remainingGroups = totalMGroups - windowStartGroup;
+                uint32_t windowMGroups = SelectGmm1ReadyWindow<Scheduler::SWIZZLE_OFFSET>(
+                    gmmAddrInfo, config, blockJob, windowStartGroup, remainingGroups);
+                uint32_t windowMOffset = windowStartGroup * config.tileM;
+                uint32_t remainingM = config.m - windowMOffset;
+                uint32_t windowMCapacity = windowMGroups * config.tileM;
+                uint32_t windowM = remainingM < windowMCapacity ? remainingM : windowMCapacity;
+
+                typename Scheduler::ProblemShape windowShape{windowM, config.schedulerN, config.k};
+                typename Scheduler::Params windowParams{
+                    Te::MakeCoord(static_cast<int64_t>(config.tileM), static_cast<int64_t>(L1_TILE_N)),
+                    static_cast<int64_t>(windowMOffset), 0, (windowOrdinal & 1U) != 0U};
+                Scheduler windowScheduler(windowShape, windowParams);
+                uint32_t windowTileNum = windowScheduler.GetTileNum();
+                uint32_t windowStartLoopIdx =
+                    (config.blockIdx < windowStartBlockIdx ? config.blockIdx + config.blockNum : config.blockIdx) -
+                    windowStartBlockIdx;
+                WorkSetType windowWorkSet{
+                    windowScheduler, gmA, gmB, gmScaleA, gmScaleB, gmBias, gmC, metaInfoGm};
+
+                Gmm1AicMmadGeneric<BlockMmadContext<BlockMmad>, IsShared, IsGmm1Interleaved>(
+                    windowWorkSet, gmmAddrInfo, config, windowStartLoopIdx, windowTileNum, vecSetSyncCom, pingpongIdx,
+                    activeBlockMmadContext);
+
+                windowStartBlockIdx = (windowStartBlockIdx + windowTileNum) % config.blockNum;
+                windowStartGroup += windowMGroups;
+                ++windowOrdinal;
+            }
+        } else {
+            while (windowStartGroup < totalMGroups) {
+                uint32_t remainingGroups = totalMGroups - windowStartGroup;
+                uint32_t windowMGroups = SelectGmm1ReadyWindow<Scheduler::SWIZZLE_OFFSET>(
+                    gmmAddrInfo, config, blockJob, windowStartGroup, remainingGroups);
+                uint32_t windowMOffset = windowStartGroup * config.tileM;
+                uint32_t remainingM = config.m - windowMOffset;
+                uint32_t windowMCapacity = windowMGroups * config.tileM;
+                uint32_t windowM = remainingM < windowMCapacity ? remainingM : windowMCapacity;
+
+                typename Scheduler::ProblemShape windowShape{windowM, config.schedulerN, config.k};
+                typename Scheduler::Params windowParams{
+                    Te::MakeCoord(static_cast<int64_t>(config.tileM), static_cast<int64_t>(L1_TILE_N)),
+                    static_cast<int64_t>(windowMOffset), 0, (windowOrdinal & 1U) != 0U};
+                Scheduler windowScheduler(windowShape, windowParams);
+                uint32_t windowTileNum = windowScheduler.GetTileNum();
+                uint32_t windowStartLoopIdx =
+                    (config.blockIdx < windowStartBlockIdx ? config.blockIdx + config.blockNum : config.blockIdx) -
+                    windowStartBlockIdx;
+                WorkSetType windowWorkSet{
+                    windowScheduler, gmA, gmB, gmScaleA, gmScaleB, gmBias, gmC, metaInfoGm};
+
+                Gmm1Aiv0EpilogueGeneric<IsGmm1Interleaved, IsWaveFlagGrained>(
+                    windowWorkSet, gmmAddrInfo, config, windowStartLoopIdx, windowTileNum, activationQuantOp,
+                    pingpongIdx);
+
+                windowStartBlockIdx = (windowStartBlockIdx + windowTileNum) % config.blockNum;
+                windowStartGroup += windowMGroups;
+                ++windowOrdinal;
+            }
+        }
+        return;
+    }
+
     WorkSetType workSet{scheduler, gmA, gmB, gmScaleA, gmScaleB, gmBias, gmC, metaInfoGm};
     if constexpr (g_coreType == AscendC::AIC) {
         if (blockMmadContext != nullptr) {
@@ -866,8 +998,8 @@ __aicore__ inline void RunGmm1Generic(
     using MakeLayoutC = typename GmmConfig::MakeLayoutC;
     GmmKernel::Gmm1ExecGeneric<BlockMmad, ElementC, MakeLayoutC, TopkWeightsPrefetch, IsShared, IsGmm1Interleaved,
                                IsWaveFlagGrained>(scheduler, params, gmmAddrInfo, config, startLoopIdx, tileNum,
-                                                  epilogueOp, vecSetSyncCom, expertBeforeCnt, expertIdx, pingpongIdx,
-                                                  typedBlockMmadContext, allowWeightL2Bypass);
+                                                  startBlockIdx, epilogueOp, vecSetSyncCom, expertBeforeCnt, expertIdx,
+                                                  pingpongIdx, typedBlockMmadContext, allowWeightL2Bypass);
 
     startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
 }
@@ -1017,7 +1149,7 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
             epilogueOp.UpdateGlobalAddr(vecBaseOffset);
         }
     }
-    if constexpr (g_coreType == AIC) {
+    if constexpr (!EnableA8W4 || g_coreType == AIC) {
         gmmAddrInfo.dispatchToGmm1Flag = reinterpret_cast<__gm__ int32_t *>(workspace.flagDispatchToGmm1Ptr) +
                                          expertOffset * syncLayout.dispatchFlagSlotCountPerExpert +
                                          static_cast<uint64_t>(expertMGroupOffset) * INT_CACHELINE;
