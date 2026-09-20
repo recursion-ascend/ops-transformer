@@ -25,6 +25,7 @@ namespace Block {
 template <uint32_t SwizzleOffset = 1, uint32_t SwizzleDirection = 0>
 class BlockSchedulerSwizzle {
 public:
+    static constexpr uint32_t SWIZZLE_OFFSET = SwizzleOffset;
     using ProblemShape = AscendC::Te::Shape<int64_t, int64_t, int64_t>;
     using BlockShape = AscendC::Te::Shape<int64_t, int64_t, int64_t>;
     using BlockCoord = AscendC::Te::Coord<int64_t, int64_t, int64_t>;
@@ -32,11 +33,17 @@ public:
 
     struct Params {
         TileShape tileShape;
+        int64_t mOffset = 0;
+        int64_t nOffset = 0;
+        bool reverseSecond = false;
     };
 
     __aicore__ inline BlockSchedulerSwizzle(const ProblemShape &shape, const Params &params)
         : problemShape_(shape),
-          tileShape_(params.tileShape)
+          tileShape_(params.tileShape),
+          mOffset_(params.mOffset),
+          nOffset_(params.nOffset),
+          reverseSecond_(params.reverseSecond)
     {
         if constexpr (SwizzleDirection == 0) {
             // m first
@@ -60,10 +67,12 @@ public:
 
     __aicore__ inline BlockShape GetBlockShape(const BlockCoord &blockCoord)
     {
+        int64_t localM = AscendC::Std::get<IDX_M_IDX>(blockCoord) - mOffset_;
+        int64_t localN = AscendC::Std::get<IDX_N_IDX>(blockCoord) - nOffset_;
         return {min(AscendC::Std::get<IDX_M_IDX>(tileShape_),
-                    AscendC::Std::get<IDX_M_IDX>(problemShape_) - AscendC::Std::get<IDX_M_IDX>(blockCoord)),
+                    AscendC::Std::get<IDX_M_IDX>(problemShape_) - localM),
                 min(AscendC::Std::get<IDX_N_IDX>(tileShape_),
-                    AscendC::Std::get<IDX_N_IDX>(problemShape_) - AscendC::Std::get<IDX_N_IDX>(blockCoord)),
+                    AscendC::Std::get<IDX_N_IDX>(problemShape_) - localN),
                 AscendC::Std::get<IDX_K_IDX>(problemShape_)};
     }
 
@@ -80,22 +89,29 @@ public:
         }
         int64_t firstIdx = blockIdx * SwizzleOffset + inBlockIdx % firstValid;
         int64_t secondIdx = inBlockIdx / firstValid;
-        if (blockIdx & 1) {
+        bool reverseSecond = (blockIdx & 1) != 0;
+        if (reverseSecond_) {
+            reverseSecond = !reverseSecond;
+        }
+        if (reverseSecond) {
             secondIdx = loopSecond_ - secondIdx - 1;
         }
 
         if constexpr (SwizzleDirection == 0) {
-            return {firstIdx * AscendC::Std::get<IDX_M_IDX>(tileShape_),
-                    secondIdx * AscendC::Std::get<IDX_N_IDX>(tileShape_), 0};
+            return {mOffset_ + firstIdx * AscendC::Std::get<IDX_M_IDX>(tileShape_),
+                    nOffset_ + secondIdx * AscendC::Std::get<IDX_N_IDX>(tileShape_), 0};
         } else {
-            return {secondIdx * AscendC::Std::get<IDX_M_IDX>(tileShape_),
-                    firstIdx * AscendC::Std::get<IDX_N_IDX>(tileShape_), 0};
+            return {mOffset_ + secondIdx * AscendC::Std::get<IDX_M_IDX>(tileShape_),
+                    nOffset_ + firstIdx * AscendC::Std::get<IDX_N_IDX>(tileShape_), 0};
         }
     }
 
 private:
     ProblemShape problemShape_;
     TileShape tileShape_;
+    int64_t mOffset_;
+    int64_t nOffset_;
+    bool reverseSecond_;
     int64_t loopFirst_;
     int64_t loopSecond_;
 };
