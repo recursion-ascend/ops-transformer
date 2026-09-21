@@ -53,9 +53,10 @@ __aicore__ inline void WaitForGmm1InputReady(const GMMAddrInfo &gmmAddrInfo, con
  * exactly the same tile permutation.
  *
  * The leader waits for the first M-group of the next window, then greedily
- * absorbs up to MaxWindow contiguous groups that are already ready. This moves
- * waiting to window boundaries and avoids exposing a not-ready future M-group
- * in the middle of an AIC's fixed tile queue.
+ * absorbs up to the requested runtime window limit. The caller chooses that
+ * limit as max(source swizzle width, M-groups needed to expose at least one
+ * tile per AIC). This moves waiting to window boundaries and avoids exposing a
+ * not-ready future M-group in the middle of an AIC's fixed tile queue.
  */
 template <typename Config>
 __aicore__ inline uint32_t SelectGmm1ReadyWindow(const GMMAddrInfo &gmmAddrInfo, const Config &config,
