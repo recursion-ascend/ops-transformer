@@ -255,8 +255,8 @@ def worker(rank: int, args):
             json.dump(result, f, indent=2)
         print(json.dumps(result, indent=2), flush=True)
 
-    sym_buffer.destroy()
     dist.barrier(group=ep_group)
+    sym_buffer.destroy()
     dist.destroy_process_group()
 
 
