@@ -625,12 +625,12 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
         uint32_t waveRowCount = waveEndTokenIndexInExpert - gmm1Position.tokenIndexInExpert;
         uint32_t problemMGroupCount = GetMGroupCountForRows(waveRowCount, GMM1_TILE_M);
         /*
-         * Readiness-aware interleaved GMM1 needs every AIC to enter the runtime
+         * Readiness-aware routed GMM1 needs every AIC to enter the runtime
          * window protocol because AIC job 0 publishes each window width even if
          * that job owns no tile in a small window. Keep the old no-work fast
-         * path for non-interleaved and prefetch variants.
+         * path only for prefetch variants.
          */
-        if constexpr (!GMM1_INTERLEAVED || TopkWeightsPrefetch) {
+        if constexpr (TopkWeightsPrefetch) {
             bool skipGmm1Problem = false;
             if constexpr (g_coreType == AIC) {
                 uint32_t problemTileCount = problemMGroupCount * gmm1TilesPerMGroup_;
