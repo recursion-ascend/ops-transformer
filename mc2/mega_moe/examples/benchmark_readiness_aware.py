@@ -6,8 +6,6 @@
 
 import argparse
 import json
-import math
-import os
 import statistics
 import subprocess
 import time
