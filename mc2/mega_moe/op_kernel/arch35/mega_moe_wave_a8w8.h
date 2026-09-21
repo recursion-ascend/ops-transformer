@@ -624,21 +624,29 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
             expertRowCount, gmm1Position.tokenIndexInExpert, remainingMGroupCount, GMM1_TILE_M);
         uint32_t waveRowCount = waveEndTokenIndexInExpert - gmm1Position.tokenIndexInExpert;
         uint32_t problemMGroupCount = GetMGroupCountForRows(waveRowCount, GMM1_TILE_M);
-        bool skipGmm1Problem = false;
-        if constexpr (g_coreType == AIC) {
-            uint32_t problemTileCount = problemMGroupCount * gmm1TilesPerMGroup_;
-            skipGmm1Problem = HandleWaveProblemWithoutWork(problemTileCount, gmmExecutionConfig_.blockJob,
-                                                           runtimeState.startBlockIdx);
-        }
-        if (skipGmm1Problem) {
-            processedMGroupCount += problemMGroupCount;
-            gmm1Position.tokenIndexInExpert = waveEndTokenIndexInExpert;
-            gmm1Position.globalTokenIndex += waveRowCount;
-            if (gmm1Position.tokenIndexInExpert >= expertRowCount) {
-                ++gmm1Position.expertIdx;
-                gmm1Position.tokenIndexInExpert = 0U;
+        /*
+         * Readiness-aware routed GMM1 needs every AIC to enter the runtime
+         * window protocol because AIC job 0 publishes each window width even if
+         * that job owns no tile in a small window. Keep the old no-work fast
+         * path only for prefetch variants.
+         */
+        if constexpr (TopkWeightsPrefetch) {
+            bool skipGmm1Problem = false;
+            if constexpr (g_coreType == AIC) {
+                uint32_t problemTileCount = problemMGroupCount * gmm1TilesPerMGroup_;
+                skipGmm1Problem = HandleWaveProblemWithoutWork(problemTileCount, gmmExecutionConfig_.blockJob,
+                                                               runtimeState.startBlockIdx);
             }
-            continue;
+            if (skipGmm1Problem) {
+                processedMGroupCount += problemMGroupCount;
+                gmm1Position.tokenIndexInExpert = waveEndTokenIndexInExpert;
+                gmm1Position.globalTokenIndex += waveRowCount;
+                if (gmm1Position.tokenIndexInExpert >= expertRowCount) {
+                    ++gmm1Position.expertIdx;
+                    gmm1Position.tokenIndexInExpert = 0U;
+                }
+                continue;
+            }
         }
         ProblemShape gmm1WaveProblemShape = gmm1ExpertState.problemShape;
         Get<M_VALUE>(gmm1WaveProblemShape) = waveEndTokenIndexInExpert - gmm1Position.tokenIndexInExpert;
