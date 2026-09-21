@@ -57,13 +57,12 @@ __aicore__ inline void WaitForGmm1InputReady(const GMMAddrInfo &gmmAddrInfo, con
  * waiting to window boundaries and avoids exposing a not-ready future M-group
  * in the middle of an AIC's fixed tile queue.
  */
-template <uint32_t MaxWindow, typename Config>
+template <typename Config>
 __aicore__ inline uint32_t SelectGmm1ReadyWindow(const GMMAddrInfo &gmmAddrInfo, const Config &config,
                                                  const BlockJobContext &blockJob, uint32_t windowStartGroup,
-                                                 uint32_t remainingGroups)
+                                                 uint32_t remainingGroups, uint32_t requestedMaxWindow)
 {
-    static_assert(MaxWindow > 0U, "GMM1 ready-window width must be positive");
-    uint32_t maxWindow = remainingGroups < MaxWindow ? remainingGroups : MaxWindow;
+    uint32_t maxWindow = remainingGroups < requestedMaxWindow ? remainingGroups : requestedMaxWindow;
     __gm__ int32_t *firstGroupFlag =
         gmmAddrInfo.dispatchToGmm1Flag + static_cast<uint64_t>(windowStartGroup) * INT_CACHELINE;
     __gm__ int32_t *windowWidthFlag = firstGroupFlag + GMM1_READY_WINDOW_CONTROL_WORD;
@@ -750,12 +749,16 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &param
     using WorkSetType = Gmm1WorkSet<Scheduler, decltype(gmA), decltype(gmB), decltype(gmScaleA), decltype(gmScaleB),
                                     decltype(gmBias), decltype(gmC), decltype(metaInfoGm)>;
 
-    constexpr bool useReadyWindow =
-        !TopkWeightsPrefetch && !IsShared && IsGmm1Interleaved && IsWaveFlagGrained;
+    constexpr bool useReadyWindow = !TopkWeightsPrefetch && !IsShared && IsWaveFlagGrained;
     if constexpr (useReadyWindow) {
         uint32_t totalMGroups = Ops::Base::CeilDiv(config.m, config.tileM);
+        uint32_t nTilesPerMGroup = Ops::Base::CeilDiv(config.schedulerN, static_cast<uint32_t>(L1_TILE_N));
+        uint32_t fillWindow =
+            nTilesPerMGroup == 0U ? 1U : Ops::Base::CeilDiv(config.blockNum, nTilesPerMGroup);
+        uint32_t maxReadyWindow =
+            fillWindow > Scheduler::SWIZZLE_OFFSET ? fillWindow : Scheduler::SWIZZLE_OFFSET;
         uint32_t windowStartGroup = 0U;
-        uint32_t windowOrdinal = 0U;
+        uint32_t swizzleGroupBase = 0U;
         uint32_t windowStartBlockIdx = problemStartBlockIdx;
         BlockJobContext blockJob{config.blockIdx, config.blockNum};
 
@@ -766,8 +769,8 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &param
 
             while (windowStartGroup < totalMGroups) {
                 uint32_t remainingGroups = totalMGroups - windowStartGroup;
-                uint32_t windowMGroups = SelectGmm1ReadyWindow<Scheduler::SWIZZLE_OFFSET>(
-                    gmmAddrInfo, config, blockJob, windowStartGroup, remainingGroups);
+                uint32_t windowMGroups = SelectGmm1ReadyWindow(
+                    gmmAddrInfo, config, blockJob, windowStartGroup, remainingGroups, maxReadyWindow);
                 uint32_t windowMOffset = windowStartGroup * config.tileM;
                 uint32_t remainingM = config.m - windowMOffset;
                 uint32_t windowMCapacity = windowMGroups * config.tileM;
@@ -776,7 +779,7 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &param
                 typename Scheduler::ProblemShape windowShape{windowM, config.schedulerN, config.k};
                 typename Scheduler::Params windowParams{
                     Te::MakeCoord(static_cast<int64_t>(config.tileM), static_cast<int64_t>(L1_TILE_N)),
-                    static_cast<int64_t>(windowMOffset), 0, (windowOrdinal & 1U) != 0U};
+                    static_cast<int64_t>(windowMOffset), 0, (swizzleGroupBase & 1U) != 0U};
                 Scheduler windowScheduler(windowShape, windowParams);
                 uint32_t windowTileNum = windowScheduler.GetTileNum();
                 uint32_t windowStartLoopIdx =
@@ -791,13 +794,13 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &param
 
                 windowStartBlockIdx = (windowStartBlockIdx + windowTileNum) % config.blockNum;
                 windowStartGroup += windowMGroups;
-                ++windowOrdinal;
+                swizzleGroupBase += Ops::Base::CeilDiv(windowMGroups, Scheduler::SWIZZLE_OFFSET);
             }
         } else {
             while (windowStartGroup < totalMGroups) {
                 uint32_t remainingGroups = totalMGroups - windowStartGroup;
-                uint32_t windowMGroups = SelectGmm1ReadyWindow<Scheduler::SWIZZLE_OFFSET>(
-                    gmmAddrInfo, config, blockJob, windowStartGroup, remainingGroups);
+                uint32_t windowMGroups = SelectGmm1ReadyWindow(
+                    gmmAddrInfo, config, blockJob, windowStartGroup, remainingGroups, maxReadyWindow);
                 uint32_t windowMOffset = windowStartGroup * config.tileM;
                 uint32_t remainingM = config.m - windowMOffset;
                 uint32_t windowMCapacity = windowMGroups * config.tileM;
@@ -806,7 +809,7 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &param
                 typename Scheduler::ProblemShape windowShape{windowM, config.schedulerN, config.k};
                 typename Scheduler::Params windowParams{
                     Te::MakeCoord(static_cast<int64_t>(config.tileM), static_cast<int64_t>(L1_TILE_N)),
-                    static_cast<int64_t>(windowMOffset), 0, (windowOrdinal & 1U) != 0U};
+                    static_cast<int64_t>(windowMOffset), 0, (swizzleGroupBase & 1U) != 0U};
                 Scheduler windowScheduler(windowShape, windowParams);
                 uint32_t windowTileNum = windowScheduler.GetTileNum();
                 uint32_t windowStartLoopIdx =
@@ -821,7 +824,7 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler &scheduler, const Params &param
 
                 windowStartBlockIdx = (windowStartBlockIdx + windowTileNum) % config.blockNum;
                 windowStartGroup += windowMGroups;
-                ++windowOrdinal;
+                swizzleGroupBase += Ops::Base::CeilDiv(windowMGroups, Scheduler::SWIZZLE_OFFSET);
             }
         }
         return;
