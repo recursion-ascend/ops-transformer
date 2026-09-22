@@ -35,6 +35,8 @@ struct WorkspaceInfo {
     GM_ADDR expertRevTokenNumsPtr;
     GM_ADDR metaInfoPtr;
     GM_ADDR flagActivationToGmm2Ptr;
+    // Positive M-group count doubles as the single-word ready publication.
+    GM_ADDR adaptiveWaveControlPtr{nullptr};
     GM_ADDR flagDispatchToGmm1Ptr;
     GM_ADDR flagSendCntCalToUpdParamsPtr;
     GM_ADDR flagGmmToEpiloguePtr{nullptr};
@@ -126,6 +128,8 @@ struct WorkspaceInfo {
         int64_t flagRegionBeginOffset = workspaceSize;
         flagActivationToGmm2Ptr = base + workspaceSize;
         workspaceSize += SIZE_INT_32 * moeExpertCount * activationFlagSlotsPerExpert;
+        adaptiveWaveControlPtr = base + workspaceSize;
+        workspaceSize += static_cast<int64_t>(INT_CACHELINE) * SIZE_INT_32;
         flagDispatchToGmm1Ptr = base + workspaceSize;
         workspaceSize += SIZE_INT_32 * moeExpertCount * waveFlagSlotsPerExpert;
 

@@ -77,6 +77,9 @@ struct GMMAddrInfo {
     __gm__ int32_t *gmmToEpilogueFlag;
     __gm__ int32_t *gmm1TileStatus;
     __gm__ int32_t *sharedExpertGmm2TileCounter;
+    // Only the A8W8 Wave caller opts into these protocols.
+    uint32_t combineCreditLimit = 0U;
+    bool onlineReadySchedule = false;
 };
 
 #if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)

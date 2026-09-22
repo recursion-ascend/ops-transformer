@@ -36,6 +36,7 @@ public:
         int64_t mOffset = 0;
         int64_t nOffset = 0;
         bool reverseSecond = false;
+        uint32_t swizzleOffset = SwizzleOffset;
     };
 
     __aicore__ inline BlockSchedulerSwizzle(const ProblemShape &shape, const Params &params)
@@ -43,7 +44,8 @@ public:
           tileShape_(params.tileShape),
           mOffset_(params.mOffset),
           nOffset_(params.nOffset),
-          reverseSecond_(params.reverseSecond)
+          reverseSecond_(params.reverseSecond),
+          swizzleOffset_(params.swizzleOffset == 0U ? SwizzleOffset : params.swizzleOffset)
     {
         if constexpr (SwizzleDirection == 0) {
             // m first
@@ -78,16 +80,16 @@ public:
 
     __aicore__ inline BlockCoord GetBlockCoord(int tileIdx)
     {
-        int64_t blockSpan = SwizzleOffset * loopSecond_;
+        int64_t blockSpan = swizzleOffset_ * loopSecond_;
         int64_t blockIdx = tileIdx / blockSpan;
         int64_t inBlockIdx = tileIdx % blockSpan;
 
-        int64_t firstValid = Min(loopFirst_ - blockIdx * SwizzleOffset, static_cast<int64_t>(SwizzleOffset));
+        int64_t firstValid = Min(loopFirst_ - blockIdx * swizzleOffset_, static_cast<int64_t>(swizzleOffset_));
         // Defensive: firstValid is always >= 1 by construction, this silences static analyzer divide-by-zero warnings.
         if (firstValid == 0) {
             firstValid = 1;
         }
-        int64_t firstIdx = blockIdx * SwizzleOffset + inBlockIdx % firstValid;
+        int64_t firstIdx = blockIdx * swizzleOffset_ + inBlockIdx % firstValid;
         int64_t secondIdx = inBlockIdx / firstValid;
         bool reverseSecond = (blockIdx & 1) != 0;
         if (reverseSecond_) {
@@ -112,6 +114,7 @@ private:
     int64_t mOffset_;
     int64_t nOffset_;
     bool reverseSecond_;
+    uint32_t swizzleOffset_;
     int64_t loopFirst_;
     int64_t loopSecond_;
 };

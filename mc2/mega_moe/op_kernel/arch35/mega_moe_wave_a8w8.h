@@ -27,6 +27,7 @@
 #include "common/mega_moe_types.h"
 #include "common/mega_moe_workspace.h"
 #include "common/mega_moe_utils.h"
+#include "common/mega_moe_online_policy.h"
 #include "common/mega_moe_exception_dump_policy.h"
 #include "blaze/epilogue/block_epilogue_activation_mx_quant.h"
 #include "stage/mega_moe_token_quant.h"
@@ -96,6 +97,7 @@ private:
     __aicore__ inline void ProcessMoeExpertStages();
     __aicore__ inline void ProcessSharedExpertGmm2();
     __aicore__ inline void ProcessGmmPipeline();
+    __aicore__ inline void SelectRuntimeMGroupsPerWave();
     __aicore__ inline bool IsSameExpertTokenPosition(const ExpertTokenPosition &currentPosition,
                                                      const ExpertTokenPosition &targetPosition) const;
     __aicore__ inline ExpertTokenPosition DispatchNextWave(ExpertTokenPosition &dispatchPosition);
@@ -140,6 +142,7 @@ private:
     uint32_t worldSize_ = 0;
     uint32_t gmm1TilesPerMGroup_ = 1U;
     uint32_t gmm2TilesPerMGroup_ = 1U;
+    uint32_t baselineMGroupsPerWave_ = 1U;
     uint32_t mGroupsPerWave_ = 1U;
     uint16_t gmm1PingPongIdx_ = 0;
     uint32_t startBlockIdx_ = 0;
@@ -153,6 +156,13 @@ private:
     uint32_t moeExpertPerRank_ = 0;
 
     static constexpr bool GMM1_INTERLEAVED = IsGmm1Interleaved;
+    static constexpr bool ONLINE_READY = MEGAMOE_READY_AWARE && !TopkWeightsPrefetch &&
+        CombineQuantMode == COMBINE_NO_QUANT;
+    // Experimental A8W8-only policy. It never enlarges a wave and falls back
+    // to the existing host-selected value unless the current batch is both
+    // sufficiently large and strongly skewed.
+    static constexpr bool ENABLE_RUNTIME_LOAD_AWARE_WAVE = MEGAMOE_LOAD_AWARE &&
+        !TopkWeightsPrefetch && CombineQuantMode == COMBINE_NO_QUANT;
 
     /*
      * AIV1 上 Dispatch 与 Combine 分阶段复用 UB，进入 Combine 前 Dispatch 的动态 ring 已经排空：
@@ -241,7 +251,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Init(
     uint32_t gmm1SchedulerWidth = GMM1_INTERLEAVED ? tilingData->hiddenDim : tilingData->hiddenDim / ACTIVATION_N_HALF;
     gmm1TilesPerMGroup_ = Ops::Base::CeilDiv(gmm1SchedulerWidth, static_cast<uint32_t>(L1_TILE_N));
     gmm2TilesPerMGroup_ = Ops::Base::CeilDiv(k_, static_cast<uint32_t>(L1_TILE_N));
-    mGroupsPerWave_ = tilingData->mGroupsPerWave == 0U ? 1U : tilingData->mGroupsPerWave;
+    baselineMGroupsPerWave_ = tilingData->mGroupsPerWave == 0U ? 1U : tilingData->mGroupsPerWave;
+    mGroupsPerWave_ = baselineMGroupsPerWave_;
     mc2Context_ = reinterpret_cast<__gm__ Mc2MoeContext *>(context);
     rankId_ = mc2Context_->epRankId;
     GM_ADDR dumpBase = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[rankId_]);
@@ -536,6 +547,50 @@ __aicore__ inline bool MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::IsSameE
            currentPosition.tokenIndexInExpert == targetPosition.tokenIndexInExpert;
 }
 
+/*
+ * Select the wave size from the current batch's realized expert-token
+ * distribution. A single AIV1 producer reads block 0's count table and
+ * publishes one decision for every AIC/AIV. Keeping the decision global is
+ * required because Dispatch, GMM1 and GMM2 must advance through identical
+ * wave boundaries on all physical blocks.
+ *
+ * V1 is deliberately conservative: it only halves the host-selected wave
+ * when a sufficiently large batch contains an expert whose M-group load is
+ * at least four times the active-expert mean. All other
+ * inputs retain the original schedule.
+ */
+template <TemplateMegaMoeA8W8WaveTypeClass>
+__aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SelectRuntimeMGroupsPerWave()
+{
+    if constexpr (!ENABLE_RUNTIME_LOAD_AWARE_WAVE) {
+        mGroupsPerWave_ = baselineMGroupsPerWave_;
+        return;
+    }
+
+    __gm__ int32_t *control =
+        reinterpret_cast<__gm__ int32_t *>(params_.workspaceInfo.adaptiveWaveControlPtr);
+    __gm__ int32_t *selectedMGroups = control;
+
+    if constexpr (g_coreType == AIV) {
+        if (GetSubBlockIdx() == 1U && countWorkspace_.blockIdx == 0U) {
+            WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
+
+            OnlinePolicy::LoadSummary load{};
+            for (uint32_t expertIdx = 0U; expertIdx < moeExpertPerRank_; ++expertIdx) {
+                load.Add(GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr,
+                    countWorkspace_, moeExpertPerRank_, expertIdx));
+            }
+            uint32_t selected = OnlinePolicy::SelectWave(baselineMGroupsPerWave_, load);
+            // Positive value is both data and readiness: one atomic scalar publication.
+            AscendC::WriteGmByPassDCache(selectedMGroups, static_cast<int32_t>(selected));
+        }
+    }
+
+    WaitUntilGmFlagIsNonZero(selectedMGroups);
+    int32_t selected = AscendC::ReadGmByPassDCache(selectedMGroups);
+    mGroupsPerWave_ = selected > 0 ? static_cast<uint32_t>(selected) : baselineMGroupsPerWave_;
+}
+
 // 规划并 Dispatch 紧接着的一个完整 WAVE，返回更新后的全局专家位置。
 template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::DispatchNextWave(
@@ -630,7 +685,7 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
          * that job owns no tile in a small window. Keep the old no-work fast
          * path only for prefetch variants.
          */
-        if constexpr (TopkWeightsPrefetch) {
+        if constexpr (!ONLINE_READY) {
             bool skipGmm1Problem = false;
             if constexpr (g_coreType == AIC) {
                 uint32_t problemTileCount = problemMGroupCount * gmm1TilesPerMGroup_;
@@ -663,6 +718,7 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
             gmm1Position.tokenIndexInExpert == 0U && static_cast<uint64_t>(waveEndTokenIndexInExpert) == expertRowCount;
         uint32_t waveTokenStartIndex =
             static_cast<uint32_t>(gmm1ExpertState.globalTokenStartIndex) + gmm1Position.tokenIndexInExpert;
+        gmm1AddrInfo.onlineReadySchedule = ONLINE_READY;
         RunGmm1GenericByWeightFormat<QuantOutType, ActivationType, QuantScaleOutType, GMM1_TILE_M, EPILOGUE_TILE_M,
                                      TopkWeightsPrefetch, GMM1_INTERLEAVED, true>(
             gmmExecutionConfig_, params_, epilogueOp_, gmm1AddrInfo, gmm1WaveProblemShape, waveTokenStartIndex,
@@ -740,6 +796,9 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             gmm2AddrInfo.gmmToEpilogueFlag =
                 reinterpret_cast<__gm__ int32_t *>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
                 static_cast<uint64_t>(gmmExecutionConfig_.blockJob.jobIndex) * INT_CACHELINE;
+            if constexpr (MEGAMOE_CREDIT_AWARE && !TopkWeightsPrefetch) {
+                gmm2AddrInfo.combineCreditLimit = OnlinePolicy::CREDIT_LIMIT;
+            }
         }
         // GMM2 与 GMM1 使用相同保护：只有完整专家 problem 才允许进一步判断是否绕过 L2。
         bool isWholeExpert =
@@ -842,6 +901,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         combineBufferConfig = InitCombineBuffers();
     }
     PrepareMoeExpertTokenCountTable(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+    SelectRuntimeMGroupsPerWave();
 
     GMMAddrInfo gmm1AddrInfo{};
     GMMAddrInfo gmm2AddrInfo{};
@@ -883,6 +943,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     }
 
     while (waveBeginPosition.expertIdx < moeExpertPerRank_) {
+        bool deferLookahead = false;
         const uint32_t waveStartBlockIndex = startBlockIdx_;
         ExpertTokenPosition waveEndPosition =
             ProcessGmm1Wave(gmm1Position, gmm1ExpertState, gmm1AddrInfo, gmm1RuntimeState);
@@ -890,8 +951,18 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             if (GetSubBlockIdx() == 1U) {
                 waveEndPosition = hasPreparedWave ? preparedWaveEndPosition : DispatchNextWave(dispatchPosition);
                 if (waveEndPosition.expertIdx < moeExpertPerRank_) {
-                    preparedWaveEndPosition = DispatchNextWave(dispatchPosition);
-                    hasPreparedWave = true;
+                    if constexpr (MEGAMOE_AIV1_ARBITRATION && !TopkWeightsPrefetch &&
+                                  CombineQuantMode == COMBINE_NO_QUANT) {
+                        __gm__ int32_t *produced = reinterpret_cast<__gm__ int32_t *>(
+                            params_.workspaceInfo.flagGmmToEpiloguePtr) +
+                            static_cast<uint64_t>(blockIdx_) * INT_CACHELINE;
+                        deferLookahead = OnlinePolicy::PreferCombine(
+                            AscendC::ReadGmByPassDCache(produced), gmm2TileSequence);
+                    }
+                    hasPreparedWave = !deferLookahead;
+                    if (!deferLookahead) {
+                        preparedWaveEndPosition = DispatchNextWave(dispatchPosition);
+                    }
                 } else {
                     hasPreparedWave = false;
                 }
@@ -914,6 +985,14 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             combineBeginExpertIndex = combineEndExpertIndex;
         }
 
+        // DispatchTokenRange drains its MTE ring before returning. Combine also
+        // drains each tile before reuse, so these are UB ownership boundaries.
+        if constexpr (g_coreType == AIV) {
+            if (GetSubBlockIdx() == 1U && deferLookahead) {
+                preparedWaveEndPosition = DispatchNextWave(dispatchPosition);
+                hasPreparedWave = true;
+            }
+        }
         const bool hasNextWave = waveEndPosition.expertIdx < moeExpertPerRank_;
         const bool fixedRoleResonance =
             startBlockIdx_ == waveStartBlockIndex && gmm1EndBlockIndex != waveStartBlockIndex;

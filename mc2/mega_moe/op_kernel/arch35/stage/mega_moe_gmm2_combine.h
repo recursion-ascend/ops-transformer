@@ -578,6 +578,16 @@ __aicore__ inline void Gmm2AicMmadGeneric(BlockMmad &blockMmad, WorkSet &workSet
             workSet.gmScaleB.Slice(Te::MakeCoord(0, nLoc), Te::MakeShape(config.scaleK, Get<N_VALUE>(actualShape)));
         auto gmBlockC = workSet.gmC.Slice(Te::MakeCoord(mLoc, nLoc),
                                           Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
+        if constexpr (NotifyCombineTileReady && !IsShared) {
+            if (gmmAddrInfo.combineCreditLimit != 0U) {
+                // Word 0: produced; word 1: consumed after MTE3 completion.
+                // This is a software throttle, not a hardware credit limit.
+                int32_t required = *gmTileSequence - static_cast<int32_t>(gmmAddrInfo.combineCreditLimit) + 1;
+                if (required > 0) {
+                    WaitUntilGmFlagAtLeast(gmmAddrInfo.gmmToEpilogueFlag + 1, required);
+                }
+            }
+        }
         blockMmad(gmBlockA, gmBlockB, gmBlockScaleA, gmBlockScaleB, workSet.gmBias, gmBlockC, singleShape);
         if constexpr (NotifyCombineTileReady && !IsShared) {
             // GMM2 tile 与配对 AIV1 的 Combine tile 一对一通知。
@@ -631,6 +641,10 @@ __aicore__ inline void CombineTokenRange(Scheduler &scheduler, TensorC &l0cOutGm
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
         gmTileSequence = expectedReadySequence;
+        if (gmmAddrInfo.combineCreditLimit != 0U) {
+            // Publish only after the remote-output MTE3 reuse fence above.
+            AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag + 1, gmTileSequence);
+        }
     }
 }
 
