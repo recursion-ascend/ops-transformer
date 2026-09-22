@@ -35,6 +35,9 @@ struct WorkspaceInfo {
     GM_ADDR expertRevTokenNumsPtr;
     GM_ADDR metaInfoPtr;
     GM_ADDR flagActivationToGmm2Ptr;
+    // A8W8 runtime load-aware wave selector. The selected M-group count and
+    // its ready flag occupy separate cache lines to avoid false sharing.
+    GM_ADDR adaptiveWaveControlPtr{nullptr};
     GM_ADDR flagDispatchToGmm1Ptr;
     GM_ADDR flagSendCntCalToUpdParamsPtr;
     GM_ADDR flagGmmToEpiloguePtr{nullptr};
@@ -126,6 +129,8 @@ struct WorkspaceInfo {
         int64_t flagRegionBeginOffset = workspaceSize;
         flagActivationToGmm2Ptr = base + workspaceSize;
         workspaceSize += SIZE_INT_32 * moeExpertCount * activationFlagSlotsPerExpert;
+        adaptiveWaveControlPtr = base + workspaceSize;
+        workspaceSize += 2LL * INT_CACHELINE * SIZE_INT_32;
         flagDispatchToGmm1Ptr = base + workspaceSize;
         workspaceSize += SIZE_INT_32 * moeExpertCount * waveFlagSlotsPerExpert;
 
