@@ -96,6 +96,7 @@ private:
     __aicore__ inline void ProcessMoeExpertStages();
     __aicore__ inline void ProcessSharedExpertGmm2();
     __aicore__ inline void ProcessGmmPipeline();
+    __aicore__ inline void SelectRuntimeMGroupsPerWave();
     __aicore__ inline bool IsSameExpertTokenPosition(const ExpertTokenPosition &currentPosition,
                                                      const ExpertTokenPosition &targetPosition) const;
     __aicore__ inline ExpertTokenPosition DispatchNextWave(ExpertTokenPosition &dispatchPosition);
@@ -140,6 +141,7 @@ private:
     uint32_t worldSize_ = 0;
     uint32_t gmm1TilesPerMGroup_ = 1U;
     uint32_t gmm2TilesPerMGroup_ = 1U;
+    uint32_t baselineMGroupsPerWave_ = 1U;
     uint32_t mGroupsPerWave_ = 1U;
     uint16_t gmm1PingPongIdx_ = 0;
     uint32_t startBlockIdx_ = 0;
@@ -153,6 +155,12 @@ private:
     uint32_t moeExpertPerRank_ = 0;
 
     static constexpr bool GMM1_INTERLEAVED = IsGmm1Interleaved;
+    // Experimental A8W8-only policy. It never enlarges a wave and falls back
+    // to the existing host-selected value unless the current batch is both
+    // sufficiently large and strongly skewed.
+    static constexpr bool ENABLE_RUNTIME_LOAD_AWARE_WAVE = true;
+    static constexpr uint32_t ADAPTIVE_WAVE_MIN_TOTAL_WAVES = 4U;
+    static constexpr uint32_t ADAPTIVE_WAVE_SKEW_FACTOR = 4U;
 
     /*
      * AIV1 上 Dispatch 与 Combine 分阶段复用 UB，进入 Combine 前 Dispatch 的动态 ring 已经排空：
@@ -241,7 +249,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Init(
     uint32_t gmm1SchedulerWidth = GMM1_INTERLEAVED ? tilingData->hiddenDim : tilingData->hiddenDim / ACTIVATION_N_HALF;
     gmm1TilesPerMGroup_ = Ops::Base::CeilDiv(gmm1SchedulerWidth, static_cast<uint32_t>(L1_TILE_N));
     gmm2TilesPerMGroup_ = Ops::Base::CeilDiv(k_, static_cast<uint32_t>(L1_TILE_N));
-    mGroupsPerWave_ = tilingData->mGroupsPerWave == 0U ? 1U : tilingData->mGroupsPerWave;
+    baselineMGroupsPerWave_ = tilingData->mGroupsPerWave == 0U ? 1U : tilingData->mGroupsPerWave;
+    mGroupsPerWave_ = baselineMGroupsPerWave_;
     mc2Context_ = reinterpret_cast<__gm__ Mc2MoeContext *>(context);
     rankId_ = mc2Context_->epRankId;
     GM_ADDR dumpBase = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[rankId_]);
@@ -534,6 +543,75 @@ __aicore__ inline bool MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::IsSameE
 {
     return currentPosition.expertIdx == targetPosition.expertIdx &&
            currentPosition.tokenIndexInExpert == targetPosition.tokenIndexInExpert;
+}
+
+/*
+ * Select the wave size from the current batch's realized expert-token
+ * distribution. A single AIV1 producer reads block 0's count table and
+ * publishes one decision for every AIC/AIV. Keeping the decision global is
+ * required because Dispatch, GMM1 and GMM2 must advance through identical
+ * wave boundaries on all physical blocks.
+ *
+ * V1 is deliberately conservative: it only halves the host-selected wave
+ * when a sufficiently large batch contains an expert whose M-group load is
+ * at least ADAPTIVE_WAVE_SKEW_FACTOR times the active-expert mean. All other
+ * inputs retain the original schedule.
+ */
+template <TemplateMegaMoeA8W8WaveTypeClass>
+__aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SelectRuntimeMGroupsPerWave()
+{
+    if constexpr (!ENABLE_RUNTIME_LOAD_AWARE_WAVE) {
+        mGroupsPerWave_ = baselineMGroupsPerWave_;
+        return;
+    }
+
+    __gm__ int32_t *control =
+        reinterpret_cast<__gm__ int32_t *>(params_.workspaceInfo.adaptiveWaveControlPtr);
+    __gm__ int32_t *selectedMGroups = control;
+    __gm__ int32_t *decisionReady = control + INT_CACHELINE;
+
+    if constexpr (g_coreType == AIV) {
+        if (GetSubBlockIdx() == 1U && countWorkspace_.blockIdx == 0U) {
+            WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
+
+            uint64_t totalMGroups = 0U;
+            uint32_t maxMGroups = 0U;
+            uint32_t activeExpertCount = 0U;
+            for (uint32_t expertIdx = 0U; expertIdx < moeExpertPerRank_; ++expertIdx) {
+                uint32_t tokenCount = GetExpertTokenCountFromWorkspace(
+                    params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_, moeExpertPerRank_, expertIdx);
+                if (tokenCount == 0U) {
+                    continue;
+                }
+                uint32_t mGroupCount = Ops::Base::CeilDiv(tokenCount, static_cast<uint32_t>(GMM1_TILE_M));
+                totalMGroups += mGroupCount;
+                maxMGroups = maxMGroups > mGroupCount ? maxMGroups : mGroupCount;
+                ++activeExpertCount;
+            }
+
+            uint32_t selected = baselineMGroupsPerWave_;
+            uint64_t minimumUsefulGroups = static_cast<uint64_t>(baselineMGroupsPerWave_) *
+                                           static_cast<uint64_t>(ADAPTIVE_WAVE_MIN_TOTAL_WAVES);
+            uint64_t skewLeft = static_cast<uint64_t>(maxMGroups) * activeExpertCount;
+            uint64_t skewRight = totalMGroups * ADAPTIVE_WAVE_SKEW_FACTOR;
+            bool enoughWork = totalMGroups >= minimumUsefulGroups;
+            bool hotspotSpansWaves = maxMGroups >= 2U * baselineMGroupsPerWave_;
+            bool stronglySkewed = activeExpertCount > 1U && skewLeft >= skewRight;
+            if (baselineMGroupsPerWave_ > 1U && enoughWork && hotspotSpansWaves && stronglySkewed) {
+                selected = baselineMGroupsPerWave_ / 2U;
+                selected = selected == 0U ? 1U : selected;
+            }
+
+            // Publish the value before its ready flag. Bypass-DCache accesses
+            // match the existing count-table producer/consumer protocol.
+            AscendC::WriteGmByPassDCache(selectedMGroups, static_cast<int32_t>(selected));
+            AscendC::WriteGmByPassDCache(decisionReady, static_cast<int32_t>(1));
+        }
+    }
+
+    WaitUntilGmFlagIsNonZero(decisionReady);
+    int32_t selected = AscendC::ReadGmByPassDCache(selectedMGroups);
+    mGroupsPerWave_ = selected > 0 ? static_cast<uint32_t>(selected) : baselineMGroupsPerWave_;
 }
 
 // 规划并 Dispatch 紧接着的一个完整 WAVE，返回更新后的全局专家位置。
@@ -834,6 +912,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         combineBufferConfig = InitCombineBuffers();
     }
     PrepareMoeExpertTokenCountTable(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+    SelectRuntimeMGroupsPerWave();
 
     GMMAddrInfo gmm1AddrInfo{};
     GMMAddrInfo gmm2AddrInfo{};
